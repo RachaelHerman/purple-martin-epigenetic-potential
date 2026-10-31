@@ -1,0 +1,57 @@
+#!/bin/bash
+#SBATCH --job-name=TrimGalore
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=40
+#SBATCH --mem=250G
+#SBATCH --time=24:00:00
+#SBATCH --partition=delmore_lab1
+#SBATCH --account=delmore_lab
+#SBATCH --array=0-19%4
+#SBATCH --output=logs/%A_%a.out
+#SBATCH --error=logs/%A_%a.err
+
+# -----------------------------
+# Configuration
+# -----------------------------
+BASE_DIR="/insomnia001/depts/delmore_lab/users/rwh2140/EM_seq_raw/split_reads"
+SCRIPT_DIR="/insomnia001/depts/delmore_lab/users/rwh2140/scripts/EM_seq/trim_fastQC.py"
+THREADS=40
+
+# List of sample subdirectories
+SAMPLES=(
+AZH055_E
+AZH091_E
+FE13K09_E
+FE13K10_E
+FE13K36_E
+FE14K44_E
+FE14K57_E
+FE14K78_E
+FE14K96_E
+FE15K28_E
+FE15K33_E
+FE15K50_E
+FG05K08_E
+FG05K10_E
+FG07K03_E
+FG07K23_E
+FG08K10_E
+MB424_E
+MBA267_E
+ONB072_E
+)
+
+# Pick sample for this array task
+SAMPLE=${SAMPLES[$SLURM_ARRAY_TASK_ID]}
+echo "Processing sample: $SAMPLE"
+
+# Activate environment
+source ~/.bashrc
+conda activate trim_env
+
+# Run python script
+python3 $SCRIPT_DIR $SAMPLE $BASE_DIR/$SAMPLE $THREADS
+
+echo "Finished sample: $SAMPLE"
+
