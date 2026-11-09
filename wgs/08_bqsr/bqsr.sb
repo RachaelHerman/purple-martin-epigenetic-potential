@@ -1,0 +1,42 @@
+#!/bin/bash
+#SBATCH --job-name=BQSR
+#SBATCH --nodes=1
+#SBATCH --mem=200G
+#SBATCH --time=8:00:00
+
+export PATH=/path/to/openjdk17/bin:$PATH
+
+REF=/path/to/GCA_022316685.1_UM_PSub_1_genomic.fna
+KNOWN_SITES=/path/to/known_sites.snp_indel.vcf.gz
+BAM_DIR=/path/to/prelim_bams
+OUTPUT_DIR=/path/to/BQSR/recal2
+mkdir -p "$OUTPUT_DIR"
+
+TMPDIR=/tmp/$USER/bqsr_tmp
+mkdir -p "$TMPDIR"
+
+BAMS=(
+  AZH055 AZH091 FE13K09 FE13K10 FE13K36 FE14K44 FE14K57 FE14K78 FE14K96 FE15K28
+  FE15K33 FE15K50 FG05K08 FG05K10 FG07K03 FG07K23 FG08K10 MB424 MBA267 ONB072
+  PM141 PM150 PM223
+)
+
+for S in "${BAMS[@]}"; do
+    INPUT_BAM="${BAM_DIR}/${S}_PE_ME_merged.sort.Mkdup.bam"
+    RECAL_TABLE="${OUTPUT_DIR}/${S}_PE_ME_merged.sort.Mkdup.recal2.table"
+    OUTPUT_BAM="${OUTPUT_DIR}/${S}_PE_ME_merged.sort.Mkdup.recal2.bam"
+
+    gatk --java-options "-Xmx180G -XX:ActiveProcessorCount=16 -Djava.io.tmpdir=$TMPDIR" BaseRecalibrator \
+        -R "$REF" \
+        -I "$INPUT_BAM" \
+        --known-sites "$KNOWN_SITES" \
+        -O "$RECAL_TABLE"
+
+    gatk --java-options "-Xmx180G -XX:ActiveProcessorCount=16 -Djava.io.tmpdir=$TMPDIR" ApplyBQSR \
+        -R "$REF" \
+        -I "$INPUT_BAM" \
+        --bqsr-recal-file "$RECAL_TABLE" \
+        -O "$OUTPUT_BAM"
+done
+
+rm -rf "$TMPDIR"

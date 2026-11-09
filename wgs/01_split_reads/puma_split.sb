@@ -1,0 +1,27 @@
+#!/bin/bash
+#SBATCH --job-name=puma_split
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=20
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=160G
+#SBATCH --time=8:00:00
+#SBATCH --array=1-20
+
+module load python/3.13
+
+RAW=/path/to/01.RawData
+OUT=/path/to/puma_wgs
+SCRIPT=split_fastq_MP_2.py
+
+SAMPLES=($(ls $RAW))
+SAMPLE=${SAMPLES[$SLURM_ARRAY_TASK_ID-1]}
+
+mkdir -p $OUT/$SAMPLE
+
+FILE_LIST=$OUT/$SAMPLE/${SAMPLE}_filelist.txt
+find $RAW/$SAMPLE -name "*_1.fq.gz" -or -name "*_R1.fastq.gz" > $FILE_LIST
+
+NB_READS=1000000
+NB_THREADS=20
+
+python3 $SCRIPT $FILE_LIST $OUT/$SAMPLE $NB_READS $NB_THREADS
