@@ -1,0 +1,796 @@
+---
+title: "Bioinformatics pipeline and analyses for methylation data"
+author: "Rachael Herman"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+---
+
+<style>
+.tocify-subheader .tocify-item {
+  text-indent: 0;
+  padding-left: 10px;
+}
+.tocify-subheader .tocify-subheader .tocify-item {
+  padding-left: 25px;
+}
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(python.reticulate = FALSE)
+```
+
+## EM-seq processing
+
+### Step 1: Bisulfite conversion and indexing of the reference genome
+
+**Reference:** *Progne subis* UM_PSub_1 (NCBI GCA_022316685.1)  
+**Software:** Bismark v0.25.1, Bowtie 2 v2.5.4
+
+Creates in-silico C→T and G→A converted copies of the reference genome and
+builds a Bowtie 2 index for each, written to a `Bisulfite_Genome/` subfolder
+of the genome directory. Run once before alignment, with default settings.
+
+```{bash, eval=FALSE}
+bismark_genome_preparation /path/to/genome_folder
+```
+
+
+### Step 2: Adapter and quality trimming
+
+**Software:** Trim Galore v0.6.10, Cutadapt v5.2 (Python 3.10.19), FastQC v0.12.1
+
+Raw paired-end reads were trimmed for Illumina adapters and low-quality bases
+(Phred < 20), with 10 bp clipped from the 5′ and 3′ ends of both reads. FastQC
+was run on the trimmed reads. All other settings were default (error rate 0.1,
+minimum adapter overlap 1 bp, minimum read length 20 bp). The command was
+reconstructed from the Trim Galore run reports, which record the parameters
+used for each sample.
+
+
+```{bash, eval=FALSE}
+#!/bin/bash
+#SBATCH --job-name=EMseq_trim
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
+#SBATCH --time=24:00:00
+#SBATCH --array=0-19
+#SBATCH --output=logs/%x_%A_%a.out
+#SBATCH --error=logs/%x_%A_%a.err
+set -euo pipefail
+
+RAW_DIR="/path/to/01.RawData"          # Novogene delivery: <sample>/<sample>_R1.fq.gz
+OUT_DIR="/path/to/EM_seq_raw/trimmed_reads"
+
+SAMPLES=(
+AZH055_E AZH091_E FE13K09_E FE13K10_E FE13K36_E
+FE14K44_E FE14K57_E FE14K78_E FE14K96_E FE15K28_E
+FE15K33_E FE15K50_E FG05K08_E FG05K10_E FG07K03_E
+FG07K23_E FG08K10_E MB424_E MBA267_E ONB072_E
+)
+sample=${SAMPLES[$SLURM_ARRAY_TASK_ID]}
+
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate trim_env
+
+mkdir -p "$OUT_DIR"
+
+trim_galore --paired --cores 4 --quality 20 --fastqc \
+    --adapter AGATCGGAAGAGCACACGTCTGAACTCCAGTCA \
+    --adapter2 AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT \
+    --clip_R1 10 --clip_R2 10 \
+    --three_prime_clip_R1 10 --three_prime_clip_R2 10 \
+    --output_dir "$OUT_DIR" \
+    "${RAW_DIR}/${sample}/${sample}_R1.fq.gz" \
+    "${RAW_DIR}/${sample}/${sample}_R2.fq.gz"
+
+# Output: ${sample}_R1_val_1.fq.gz / ${sample}_R2_val_2.fq.gz (input to step 2)
+
+```
+
+### Step 3: Alignment, sorting, read groups, and duplicate removal
+
+**Software:** Bismark v0.25.1, Bowtie 2 v2.5.4, Samtools v1.17, Picard v3.4.0
+
+Trimmed reads were aligned to the bisulfite-converted reference with Bismark
+(default settings), then coordinate-sorted and indexed. Read groups were added
+and duplicates removed with Picard. A name-sorted copy of each deduplicated
+BAM was made for the read-level methylation analysis. Read-group fields are
+shown as originally run; they are metadata only and do not affect results.
+
+```{bash, eval=FALSE}
+#!/bin/bash
+#SBATCH --job-name=EMseq_align
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=24
+#SBATCH --mem=256G
+#SBATCH --time=12:00:00
+#SBATCH --array=0-19
+#SBATCH --output=logs/%x_%A_%a.out
+#SBATCH --error=logs/%x_%A_%a.err
+set -euo pipefail
+
+
+TRIM_DIR="/path/to/EM_seq_raw/trimmed_reads"
+REF_DIR="/path/to/bismark_reference"
+OUT_DIR="/path/to/EM_seq_raw/bams"
+PICARD="java -jar /path/to/picard.jar"
+THREADS=12
+
+SAMPLES=(
+AZH055_E AZH091_E FE13K09_E FE13K10_E FE13K36_E
+FE14K44_E FE14K57_E FE14K78_E FE14K96_E FE15K28_E
+FE15K33_E FE15K50_E FG05K08_E FG05K10_E FG07K03_E
+FG07K23_E FG08K10_E MB424_E MBA267_E ONB072_E
+)
+sample=${SAMPLES[$SLURM_ARRAY_TASK_ID]}
+
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate bismark_env
+
+R1="${TRIM_DIR}/${sample}_R1_val_1.fq.gz"
+R2="${TRIM_DIR}/${sample}_R2_val_2.fq.gz"
+SAMPLE_DIR="${OUT_DIR}/${sample}"
+mkdir -p "${SAMPLE_DIR}"
+
+# 1. Align to the bisulfite-converted reference (directional library, default settings)
+bismark --bowtie2 --multicore ${THREADS} \
+    --genome "${REF_DIR}" -1 "$R1" -2 "$R2" -o "${SAMPLE_DIR}"
+BAM="${SAMPLE_DIR}/${sample}_R1_val_1_bismark_bt2_pe.bam"
+
+# 2. Coordinate-sort and index
+SORTED="${SAMPLE_DIR}/${sample}.sort.bam"
+samtools sort -@ ${THREADS} -o "$SORTED" "$BAM"
+samtools index "$SORTED"
+
+# 3. Add read groups
+#    Values as originally run; read-group fields are metadata only and do not
+#    affect alignment, duplicate removal or methylation calls.
+RG="${SAMPLE_DIR}/${sample}.sort.RG.bam"
+$PICARD AddOrReplaceReadGroups I="$SORTED" O="$RG" \
+    LB=Veeramah PL=COMPLETE PU=BGI SM="$sample" CN=BGI \
+    VALIDATION_STRINGENCY=SILENT
+
+# 4. Remove PCR/optical duplicates
+DEDUP="${SAMPLE_DIR}/${sample}.sort.RG.dedup.bam"
+$PICARD MarkDuplicates I="$RG" O="$DEDUP" \
+    M="${SAMPLE_DIR}/${sample}.dedup.metrics.txt" \
+    ASSUME_SORTED=TRUE REMOVE_DUPLICATES=TRUE \
+    VALIDATION_STRINGENCY=LENIENT CREATE_INDEX=TRUE
+
+# 5. Name-sort for read-level methylation analysis (CGI subsetting / epialleleR)
+samtools sort -n -@ ${THREADS} -o "${SAMPLE_DIR}/${sample}.namesort.RG.dedup.bam" "$DEDUP"
+
+```
+
+## Methylation Entropy Pipeline
+
+### Step 4: Identifying CpG islands
+
+CpG islands were identified in the *P. subis* reference genome (GCA_022316685.1)
+using `newcpgreport` from EMBOSS v<VERSION> (Rice et al. 2000) with default settings:
+100 bp sliding window, observed/expected CpG ratio > 0.6, GC content > 50%,
+and minimum length 200 bp.
+
+```{bash, eval=FALSE}
+newcpgreport -sequence GCA_022316685.1_genomic.fna -outfile puma.newcpgreport -auto
+```
+
+### Step 5: Subsetting BAMs to CpG islands
+
+The name-sorted, deduplicated BAM for each sample was coordinate-sorted, and
+reads overlapping CpG islands were extracted with Samtools v1.22. The subset was
+name-sorted, mate information was updated with `samtools fixmate -m`, and the
+result was name-sorted again for read-level methylation pattern extraction required
+epialleleR.
+
+```{bash, eval=FALSE}
+# Coordinate-sort
+samtools sort -o ${sample}_PE_merged.sort.readname.RG.Mkdup.bismark.coord.bam \
+    ${sample}_PE_merged.sort.readname.RG.Mkdup.bismark.bam
+
+# Extract reads overlapping CpG islands
+samtools view -b -L PUMA_CpG_islands.sorted.bed \
+    ${sample}_PE_merged.sort.readname.RG.Mkdup.bismark.coord.bam \
+    > ${sample}_PE_merged.sort.readname.RG.Mkdup.islands.coord.bam
+
+# Name-sort, fix mate information, and name-sort again
+samtools sort -n -o ${sample}_PE_merged.sort.readname.RG.Mkdup.islands.name.bam \
+    ${sample}_PE_merged.sort.readname.RG.Mkdup.islands.coord.bam
+
+samtools fixmate -m ${sample}_PE_merged.sort.readname.RG.Mkdup.islands.name.bam \
+    ${sample}_PE_merged.sort.readname.RG.Mkdup.islands.fixmate.bam
+
+samtools sort -n -o ${sample}_PE_merged.sort.readname.RG.Mkdup.CpG_islands.name_sorted.bam \
+    ${sample}_PE_merged.sort.readname.RG.Mkdup.islands.fixmate.bam
+```
+
+### Step 6: Container environment for epiallele extraction
+
+Read-level pattern extraction was run inside an Apptainer container built on
+the `rocker/r-ver:4.3.3` image (R v4.3.3) with Bioconductor v3.18, epialleleR
+v<VERSION> and data.table v<VERSION>. The container can be rebuilt from the
+definition file below, or downloaded from Zenodo (doi: <DOI>).
+
+```{bash, eval=FALSE}
+apptainer build epialleleR.sif epialleleR.def
+```
+
+And use the following `epialleleR.def` script file
+
+```{bash, eval=FALSE}
+Bootstrap: docker
+From: rocker/r-ver:4.3.3
+
+%post
+    set -e
+
+    # ----------------------------
+    # System dependencies (CRITICAL)
+    # ----------------------------
+    apt-get update && apt-get install -y \
+        build-essential \
+        libcurl4-openssl-dev \
+        libssl-dev \
+        libxml2-dev \
+        zlib1g-dev \
+        libbz2-dev \
+        liblzma-dev \
+        libpng-dev \
+        libjpeg-dev \
+        libfreetype6-dev \
+        libfontconfig1-dev \
+        libgit2-dev \
+        && apt-get clean
+
+
+    R -e "install.packages('BiocManager', repos='https://cloud.r-project.org')"
+
+    R -e "BiocManager::install(version = '3.18', ask = FALSE, update = FALSE)"
+
+    R -e "BiocManager::install(c(
+        'BiocGenerics',
+        'S4Vectors',
+        'IRanges',
+        'GenomeInfoDb',
+        'GenomicRanges',
+        'Biostrings'
+    ), ask = FALSE, update = FALSE)"
+
+    R -e "BiocManager::install(c(
+        'Rsamtools',
+        'GenomicAlignments',
+        'rtracklayer'
+    ), ask = FALSE, update = FALSE)"
+
+    R -e "BiocManager::install(c(
+        'GenomicFeatures',
+        'AnnotationDbi'
+    ), ask = FALSE, update = FALSE)"
+
+    R -e "BiocManager::install('epialleleR', ask = FALSE, update = FALSE)"
+
+%environment
+    export R_LIBS_USER=/usr/local/lib/R/site-library
+    export LC_ALL=C
+
+%runscript
+    exec R "$@"
+
+```
+
+
+### Step 7: Extracting read-level methylation patterns
+
+Read-level methylation patterns were extracted for every CpG island in every
+sample with `extractPatterns()` from epialleleR v<VERSION> (Nikolaienko et al.
+2023), run in R v<VERSION> inside an Apptainer container. To run in parallel,
+the CpG island BED file was split into chunks; each chunk was processed for all
+20 samples as a SLURM array job (one task per sample). For each island, the
+script records every read's methylation pattern across the CpG positions it
+covers, along with its beta value. Results are written in long format, one row
+per read per CpG position, with a status log recording whether each island
+passed or returned no patterns.
+
+For parallelization, the CpG island BED file was split into chunks and each chunk was run as a separate job. Chunking does not affect results; the full BED file can also be passed to the script directly.
+
+```{bash, eval=FALSE}
+#!/bin/bash
+#SBATCH --job-name=epiallele_cpg_chunk_aa
+#SBATCH --partition=short
+#SBATCH --account=delmore_lab
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=128G
+#SBATCH --time=12:00:00
+#SBATCH --array=1-20
+#SBATCH --output=slurm_logs/%x_%A_%a.out
+#SBATCH --error=slurm_logs/%x_%A_%a.err
+
+set -euo pipefail
+module load apptainer
+
+BAM_LIST=your_bams_list.txt # text file with full file paths to CGI subsetted bams
+
+BAM=$(sed -n "${SLURM_ARRAY_TASK_ID}p" "$BAM_LIST")
+
+BED=$PWD/cpg_island_chunks/cpg_chunk_aa
+CHUNK_ID=cpg_chunk_aa
+
+OUTDIR=$PWD/results_cpg_chunk_aa
+mkdir -p "$OUTDIR"
+
+apptainer exec \
+    --bind /insomnia001:/insomnia001 \
+    epialleleR.sif \
+    Rscript extract_incremental_v2.R \
+        "$BAM" \
+        "$BED" \
+        "$CHUNK_ID" \
+        "$OUTDIR"
+
+```
+
+**Epiallele extraction script `extract_incremental_v2.R`**
+```{r, eval=FALSE}
+#!/usr/bin/env Rscript
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(epialleleR)
+})
+
+# Set up arguments for running script
+
+args <- commandArgs(trailingOnly = TRUE)
+if (length(args) < 4) {
+  stop("Usage: Rscript extract_incremental_v2.R <bam> <bed> <chunk_id> <outdir>")
+}
+
+bam <- normalizePath(args[1], mustWork = TRUE)
+bed_file <- normalizePath(args[2], mustWork = TRUE)
+chunk_id <- args[3]
+outdir<- args[4]
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+sample <- tools::file_path_sans_ext(basename(bam))
+
+
+# Load CpG islands
+
+bed <- fread(bed_file, header = FALSE)
+if (ncol(bed) < 3) stop("BED must have at least 3 columns")
+setnames(bed, 1:3, c("chrom", "start", "end"))
+
+if (ncol(bed) >= 4) {
+  bed[, cpg_island_id := as.character(get(names(bed)[4]))]
+} else {
+  bed[, cpg_island_id := paste0("cpg_island_", seq_len(.N))]
+}
+setorder(bed, chrom, start, end)
+
+
+# Output files (headers)
+
+long_file   <- file.path(outdir, paste0(sample, ".", chunk_id, ".epiallele_long.tsv"))
+status_file <- file.path(outdir, paste0(sample, ".", chunk_id, ".epiallele_status.tsv"))
+
+fwrite(data.table(
+  cpg_island_id = character(), chrom = character(), status = character(),
+  n_patterns = integer(), n_cpg_cols = integer(),
+  runtime_sec = numeric(), message = character()
+), status_file, sep = "\t")
+
+fwrite(data.table(
+  seqnames = character(), strand = character(), start = integer(), end = integer(),
+  nbase = integer(), beta = numeric(), pattern = character(),
+  position = character(), state = character(),
+  cpg_island_id = character(), chrom = character(),
+  start_region = integer(), end_region = integer(), sample = character()
+), long_file, sep = "\t")
+
+write_status <- function(id, chr, status, n_patterns, n_cpg_cols, t0, msg) {
+  fwrite(data.table(
+    cpg_island_id = id, chrom = chr, status = status,
+    n_patterns = n_patterns, n_cpg_cols = n_cpg_cols,
+    runtime_sec = as.numeric(difftime(Sys.time(), t0, units = "secs")),
+    message = msg
+  ), status_file, sep = "\t", append = TRUE, col.names = FALSE)
+}
+
+meta_names <- c("seqnames", "strand", "start", "end", "nbase", "beta", "pattern")
+
+
+# Extract methylation patterns one CpG island at a time
+
+for (i in seq_len(nrow(bed))) {
+
+  region <- bed[i]
+  id  <- region$cpg_island_id
+  chr <- region$chrom
+  t0  <- Sys.time()
+
+  # Temporary single-island BED
+  tmp_bed <- file.path(outdir, paste0("tmp_", chunk_id, "_", i, ".bed"))
+  fwrite(region[, .(chrom, start, end)], tmp_bed, sep = "\t", col.names = FALSE)
+
+  ep <- tryCatch(
+    extractPatterns(bam = bam, bed = tmp_bed, verbose = FALSE),
+    error = function(e) list(.error = e$message)
+  )
+  invisible(file.remove(tmp_bed))
+
+  if (is.list(ep) && !is.null(ep$.error)) {
+    write_status(id, chr, "ERROR", 0, 0, t0, ep$.error)
+    next
+  }
+  if (is.null(ep) || nrow(ep) == 0) {
+    write_status(id, chr, "EMPTY", 0, 0, t0, "No epiallele patterns returned")
+    next
+  }
+
+  dt <- as.data.table(ep)
+  meta_cols <- intersect(meta_names, colnames(dt))
+  cpg_cols  <- setdiff(colnames(dt), meta_cols)
+
+  if (length(cpg_cols) == 0) {
+    write_status(id, chr, "NO_CPG", nrow(dt), 0, t0, "No CpG columns in epiallele output")
+    next
+  }
+
+  # Long format: one row per pattern x CpG position, empty states dropped
+  long_dt <- melt(dt, id.vars = meta_cols, measure.vars = cpg_cols,
+                  variable.name = "position", value.name = "state")
+  long_dt <- long_dt[!is.na(state) & state != ""]
+
+  if (nrow(long_dt) == 0) {
+    write_status(id, chr, "FILTERED_EMPTY", nrow(dt), length(cpg_cols), t0,
+                 "All CpG states filtered out")
+    next
+  }
+
+  long_dt[, `:=`(cpg_island_id = id, chrom = chr,
+                 start_region = region$start, end_region = region$end,
+                 sample = sample)]
+  fwrite(long_dt, long_file, sep = "\t", append = TRUE, col.names = FALSE)
+
+  write_status(id, chr, "PASS", nrow(dt), length(cpg_cols), t0, "OK")
+}
+
+```
+
+
+### Step 8: Counting reads per methylation pattern
+
+For each sample, the long-format output was collapsed to one row per read, and
+reads were counted for each combination of CpG island and methylation pattern.
+This gives the frequency distribution of methylation patterns per CpG island per
+individual used in the entropy analysis. CpG islands are identified by their
+coordinates (`chrom:start-end`). 
+
+SLURM submission script `beta_counter.sb`
+
+```{bash, eval=FALSE}
+#!/bin/bash
+#SBATCH --job-name=beta_counts_cgi
+#SBATCH --time=12:00:00
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=128G
+#SBATCH --output=logs/%x_%j.out
+#SBATCH --error=logs/%x_%j.err
+set -euo pipefail
+
+INDIR="/path/to/epiallele_long_files"     # one combined long-format file per sample
+OUTDIR="/path/to/beta_counts"
+SUFFIX="<input file suffix>"                   # e.g. part after the sample name
+
+eval "$(conda shell.bash hook)"
+conda activate puma_cpg_env
+mkdir -p "$OUTDIR"
+
+for f in "$INDIR"/*"$SUFFIX"; do
+    sample=$(basename "$f" "$SUFFIX")
+    python beta_epiallele_cgi.py "$f" "$OUTDIR/${sample}_beta_counts.tsv"
+done
+```
+
+Counting script `beta_epiallele_cgi.py`
+
+```{python, eval=FALSE}
+#!/usr/bin/env python3
+
+import sys
+import pandas as pd
+
+infile, outfile = sys.argv[1], sys.argv[2]
+
+df = pd.read_csv(infile, sep="\t", low_memory=False)
+
+# CpG island identifier from island coordinates
+df["cpg_island_id"] = (
+    df["chrom"].astype(str) + ":"
+    + df["start_region"].astype(str) + "-"
+    + df["end_region"].astype(str)
+)
+
+# Force numeric columns and drop rows where conversion failed
+df["nbase"] = pd.to_numeric(df["nbase"], errors="coerce")
+df["beta"] = pd.to_numeric(df["beta"], errors="coerce")
+df = df.dropna(subset=["nbase", "beta"])
+
+# Collapse from one row per read x CpG position to one row per read
+reads = df[
+    ["sample", "cpg_island_id", "pattern",
+     "seqnames", "start", "end", "strand", "nbase", "beta"]
+].drop_duplicates()
+
+# Reads per sample x island x pattern
+counts = (
+    reads
+    .groupby(["sample", "cpg_island_id", "pattern"])
+    .agg(
+        count=("pattern", "size"),
+        mean_nbase=("nbase", "mean"),
+        mean_beta=("beta", "mean"),
+        sd_beta=("beta", "std"),
+    )
+    .reset_index()
+)
+
+# Total reads per sample x island
+counts["total_reads"] = (
+    counts.groupby(["sample", "cpg_island_id"])["count"].transform("sum")
+)
+
+counts.to_csv(outfile, sep="\t", index=False)
+```
+
+
+### Step 9: Realized methylation entropy by repeated subsampling
+
+To make entropy comparable across individuals with different sequencing depth,
+each CpG island was analyzed at a fixed read depth D, taken from a per-island
+depth table (`cpg_island_depths.tsv`; islands with D < 10 excluded). Individuals
+with fewer than D reads at an island were excluded from that island. For each
+island, 10,000 iterations were run: for every retained individual, D reads were
+drawn without replacement and the Shannon entropy of their methylation pattern
+frequencies was calculated (Xie et al. 2011),
+
+$$H = -\sum_i p_i \log_2 p_i, \quad p_i = n_i / D$$
+
+Entropy was averaged within the North and South populations, and the difference
+(North − South) was recorded. Each island's Δ is the mean difference across
+iterations, and 95% intervals for the North and South means are the 2.5th and
+97.5th percentiles of the iteration-level population means. 
+
+**SLURM submission script (`bootstrap_cgi.sb`):**
+
+```{bash, eval=FALSE}
+#!/bin/bash
+#SBATCH --job-name=epi_entropy_bootstrap
+#SBATCH --time=12:00:00
+#SBATCH --cpus-per-task=50
+#SBATCH --mem=350G
+#SBATCH --output=logs/%x_%j.out
+#SBATCH --error=logs/%x_%j.err
+set -euo pipefail
+
+LONG_DIR="/path/to/epiallele_long_files"
+DEPTH="/path/to/cpg_island_depths.tsv"
+OUT="epi_entropy_cgi_bootstrap.tsv"
+NBOOT=10000
+SCRIPT="epi_entropy_bootstrap_cgi_v2.py"
+
+eval "$(conda shell.bash hook)"
+conda activate puma_cpg_env
+
+# One thread per worker process
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
+
+FILES=("$LONG_DIR"/*.combined.epiallele_long.with_ids.tsv)
+
+python "$SCRIPT" "${FILES[*]}" "$DEPTH" "$OUT" "$NBOOT"
+```
+
+**Subsampling script `epi_entropy_bootstrap_cgi_v2.py`**
+
+```{python, eval=FALSE}
+#!/usr/bin/env python3
+
+import os
+import sys
+from multiprocessing import Pool
+
+import numpy as np
+import pandas as pd
+
+files = sys.argv[1].split()
+depth_file = sys.argv[2]
+out_file = sys.argv[3]
+n_boot = int(sys.argv[4])
+
+# ----------------------------
+# Population assignment
+# ----------------------------
+north = {"AZH055", "AZH091", "FG05K08", "FG05K10", "FG07K03",
+         "FG07K23", "FG08K10", "MB424", "MBA267", "ONB072"}
+south = {"FE13K09", "FE13K10", "FE13K36", "FE14K44", "FE14K57",
+         "FE14K78", "FE14K96", "FE15K28", "FE15K33", "FE15K50"}
+ALL_SAMPLES = north | south
+
+
+def extract_sample(filepath):
+    basename = os.path.basename(filepath)
+    for s in ALL_SAMPLES:
+        if basename.startswith(s):
+            return s
+    return None
+
+
+def get_pop(sample):
+    if sample in north:
+        return "north"
+    if sample in south:
+        return "south"
+    return None
+
+
+
+# Fixed read depth D per CpG island
+
+depth = pd.read_csv(depth_file, sep="\t")
+for c in ["cpg_island_id", "D_CpG_island"]:
+    if c not in depth.columns:
+        raise RuntimeError(f"Missing {c}. Found: {depth.columns.tolist()}")
+
+depth["D_CpG_island"] = pd.to_numeric(depth["D_CpG_island"], errors="coerce")
+depth = depth.dropna(subset=["D_CpG_island"])
+depth = depth[depth["D_CpG_island"] >= 10]
+depth_map = dict(zip(depth["cpg_island_id"], depth["D_CpG_island"].astype(int)))
+
+
+
+# Shannon entropy of pattern frequencies
+
+def entropy(patterns):
+    _, counts = np.unique(patterns, return_counts=True)
+    p = counts / counts.sum()
+    return -np.sum(p * np.log2(p))
+
+
+# Load pattern counts per sample x island
+
+tables = []
+for f in files:
+    sample = extract_sample(f)
+    if sample is None:
+        print(f"WARNING: could not match {os.path.basename(f)} to a sample; skipping",
+              file=sys.stderr)
+        continue
+    pop = get_pop(sample)
+
+    df = pd.read_csv(f, sep="\t", usecols=["cpg_island_id", "pattern"], low_memory=False)
+    df = df[df["cpg_island_id"].isin(depth_map)]
+    if df.empty:
+        continue
+
+    counts = df.groupby(["cpg_island_id", "pattern"]).size().reset_index(name="count")
+    counts["sample"] = sample
+    counts["population"] = pop
+    tables.append(counts)
+
+read_table = pd.concat(tables, ignore_index=True)
+del tables
+
+
+# Subsampling, parallelized across islands
+
+workers = int(os.environ.get("SLURM_CPUS_PER_TASK", 1))
+
+ISLAND_TABLES = {pid: sub for pid, sub in read_table.groupby("cpg_island_id")}
+DEPTH_MAP_G = None
+NBOOT_G = None
+
+
+def init_worker(island_tables, depth_map_arg, nboot_arg):
+    global ISLAND_TABLES, DEPTH_MAP_G, NBOOT_G
+    ISLAND_TABLES = island_tables
+    DEPTH_MAP_G = depth_map_arg
+    NBOOT_G = nboot_arg
+
+
+def process_island(pid):
+    sub = ISLAND_TABLES.get(pid)
+    if sub is None or sub.empty:
+        return None
+
+    D = DEPTH_MAP_G[pid]
+
+    # Expand counts to one entry per read; keep individuals with >= D reads
+    sample_arrays, sample_pops = {}, {}
+    for sample in sub["sample"].unique():
+        ss = sub[sub["sample"] == sample]
+        expanded = np.repeat(ss["pattern"].values, ss["count"].values)
+        if len(expanded) >= D:
+            sample_arrays[sample] = expanded
+            sample_pops[sample] = ss["population"].iloc[0]
+    if not sample_arrays:
+        return None
+
+    north_vals, south_vals, delta_vals = [], [], []
+    for _ in range(NBOOT_G):
+        n_entropy, s_entropy = [], []
+        for sample, expanded in sample_arrays.items():
+            h = entropy(np.random.choice(expanded, size=D, replace=False))
+            if sample_pops[sample] == "north":
+                n_entropy.append(h)
+            else:
+                s_entropy.append(h)
+
+        if n_entropy and s_entropy:
+            n_mean, s_mean = np.mean(n_entropy), np.mean(s_entropy)
+            north_vals.append(n_mean)
+            south_vals.append(s_mean)
+            delta_vals.append(n_mean - s_mean)
+
+    if not delta_vals:
+        return None
+
+    delta_array = np.array(delta_vals)
+    delta = delta_array.mean()
+
+    # Proportion of iterations with delta on the opposite side of zero
+    if delta > 0:
+        n_extreme = np.sum(delta_array <= 0)
+    elif delta < 0:
+        n_extreme = np.sum(delta_array >= 0)
+    else:
+        n_extreme = len(delta_array)
+    p_value = (n_extreme + 1) / (len(delta_array) + 1)
+
+    return {
+        "cpg_island_id": pid,
+        "north_mean": np.mean(north_vals),
+        "south_mean": np.mean(south_vals),
+        "delta": delta,
+        "delta_ci_low": np.percentile(delta_vals, 2.5),
+        "delta_ci_high": np.percentile(delta_vals, 97.5),
+        "p_value": p_value,
+        "north_ci_low": np.percentile(north_vals, 2.5),
+        "north_ci_high": np.percentile(north_vals, 97.5),
+        "south_ci_low": np.percentile(south_vals, 2.5),
+        "south_ci_high": np.percentile(south_vals, 97.5),
+    }
+
+
+if __name__ == "__main__":
+    results = []
+    with Pool(processes=workers, initializer=init_worker,
+              initargs=(ISLAND_TABLES, depth_map, n_boot)) as pool:
+        for r in pool.imap_unordered(process_island, list(depth_map), chunksize=25):
+            if r is not None:
+                results.append(r)
+
+    out = pd.DataFrame(results)
+
+
+    # Benjamini-Hochberg FDR
+
+    p = out["p_value"].to_numpy()
+    order = np.argsort(p)
+    m = len(p)
+    fdr_sorted = p[order] * m / np.arange(1, m + 1)
+    fdr_sorted = np.minimum.accumulate(fdr_sorted[::-1])[::-1]
+    fdr_sorted = np.minimum(fdr_sorted, 1.0)
+    out["FDR"] = np.empty(m)
+    out.loc[order, "FDR"] = fdr_sorted
+
+    out.sort_values("cpg_island_id").to_csv(out_file, sep="\t", index=False)
+```

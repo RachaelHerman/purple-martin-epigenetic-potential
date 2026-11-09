@@ -1,0 +1,879 @@
+---
+title: "Bioinformatics pipeline and analyses for whole genome resequencing data"
+author: "Rachael Herman"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+---
+
+<style>
+.tocify-subheader .tocify-item {
+  text-indent: 0;
+  padding-left: 10px;
+}
+.tocify-subheader .tocify-subheader .tocify-item {
+  padding-left: 25px;
+}
+</style>
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(python.reticulate = FALSE)
+```
+
+# WGS pipeline
+
+## 1. Split raw reads
+
+`puma_split.sb`
+
+```{bash, eval=FALSE}
+#!/bin/bash
+#SBATCH --job-name=puma_split
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=20
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=160G
+#SBATCH --time=8:00:00
+#SBATCH --array=1-20
+
+module load python/3.13
+
+RAW=/path/to/01.RawData
+OUT=/path/to/puma_wgs
+SCRIPT=split_fastq_MP_2.py
+
+SAMPLES=($(ls $RAW))
+SAMPLE=${SAMPLES[$SLURM_ARRAY_TASK_ID-1]}
+
+mkdir -p $OUT/$SAMPLE
+
+FILE_LIST=$OUT/$SAMPLE/${SAMPLE}_filelist.txt
+find $RAW/$SAMPLE -name "*_1.fq.gz" -or -name "*_R1.fastq.gz" > $FILE_LIST
+
+NB_READS=1000000
+NB_THREADS=20
+
+python3 $SCRIPT $FILE_LIST $OUT/$SAMPLE $NB_READS $NB_THREADS
+```
+
+`split_fastq_MP_2.py`
+
+```{python, eval=FALSE, python.reticulate=FALSE}
+#!/usr/bin/env python3
+import os
+import sys
+import multiprocessing as mp
+from subprocess import Popen
+
+SPLIT_FASTQ_SCRIPT = "split_fastq.py"
+
+if len(sys.argv) != 5:
+    print(f"Usage: {sys.argv[0]} <file_list> <outdirectory> <nb_reads> <nbthreads>")
+    sys.exit(1)
+
+file_list = sys.argv[1]
+outdirectory = sys.argv[2]
+nb_reads = int(sys.argv[3])
+nbthreads = int(sys.argv[4])
+
+fileout_path = os.path.join(outdirectory, os.path.basename(file_list) + '.FINISHED')
+fileout = open(fileout_path, 'w')
+
+with open(file_list, 'r') as f:
+    data = [line.strip() for line in f if line.strip()]
+
+runs = []
+samp_dirs = {}
+
+for filepath in data:
+    if filepath.endswith('.R1.fastq.gz'):
+        parts = filepath.split('/')
+        directory = '/'.join(parts[:-1])
+        samp_dir = parts[-2]
+        run_id = parts[-1].replace('.R1.fastq.gz', '')
+        if samp_dir not in samp_dirs:
+            samp_dirs[samp_dir] = []
+        samp_dirs[samp_dir].append(run_id)
+        batch_name = parts[-2].split('_')[1] + '_' + str(samp_dirs[samp_dir].index(run_id) + 1)
+        runs.append([directory, samp_dir, run_id, batch_name])
+
+    elif filepath.endswith('_1.fq.gz'):
+        parts = filepath.split('/')
+        directory = '/'.join(parts[:-1])
+        samp_dir = parts[-2]
+        run_id = parts[-1].replace('_1.fq.gz', '')
+        if samp_dir not in samp_dirs:
+            samp_dirs[samp_dir] = []
+        samp_dirs[samp_dir].append(run_id)
+        batch_name = samp_dir + '_' + str(samp_dirs[samp_dir].index(run_id) + 1)
+        runs.append([directory, samp_dir, run_id, batch_name])
+
+for samp_dir in samp_dirs.keys():
+    os.makedirs(os.path.join(outdirectory, samp_dir), exist_ok=True)
+
+batches = [runs[i:i + nbthreads] for i in range(0, len(runs), nbthreads)]
+cwd = os.getcwd()
+
+def split_fastq(idx, splits, outdirectory, nb_reads, output_queue):
+    os.chdir(cwd)
+    directory, samp_dir, run_id, batch_name = splits[idx]
+    output_path = os.path.join(outdirectory, samp_dir, batch_name)
+    cmd = f"{SPLIT_FASTQ_SCRIPT} {run_id} {directory} {output_path} {nb_reads}"
+    proc = Popen(cmd, shell=True)
+    proc.wait()
+    output_queue.put(f"finished {batch_name}")
+
+for batch in batches:
+    output_queue = mp.Queue()
+    processes = [mp.Process(target=split_fastq, args=(i, batch, outdirectory, nb_reads, output_queue))
+                 for i in range(len(batch))]
+    for p in processes:
+        p.start()
+    for p in processes:
+        p.join()
+    results = [output_queue.get() for _ in processes]
+    for r in results:
+        fileout.write(r + '\n')
+
+fileout.close()
+```
+
+`split_fastq.py`
+
+```{python, eval=FALSE, python.reticulate=FALSE}
+#!/usr/bin/env python3
+import gzip
+from subprocess import Popen
+import sys
+import os
+
+stem = sys.argv[1]
+directory = sys.argv[2]
+fileout_stem = sys.argv[3]
+nb_reads = int(sys.argv[4])
+
+file1_path_r1 = os.path.join(directory, stem + '.R1.fastq.gz')
+file2_path_r2 = os.path.join(directory, stem + '.R2.fastq.gz')
+file1_path_r1_alt = os.path.join(directory, stem + '_1.fq.gz')
+file2_path_r2_alt = os.path.join(directory, stem + '_2.fq.gz')
+
+try:
+    file1 = gzip.open(file1_path_r1, 'rt')
+    file2 = gzip.open(file2_path_r2, 'rt')
+except FileNotFoundError:
+    file1 = gzip.open(file1_path_r1_alt, 'rt')
+    file2 = gzip.open(file2_path_r2_alt, 'rt')
+
+count_read = 0
+count_file = 1
+
+head1 = file1.readline()
+head2 = file2.readline()
+
+fileout1 = open(f'{fileout_stem}_split_{count_file}_R1.fq', 'w')
+fileout2 = open(f'{fileout_stem}_split_{count_file}_R2.fq', 'w')
+
+while head1:
+    seq1 = file1.readline()
+    seq2 = file2.readline()
+    line1 = file1.readline()
+    line2 = file2.readline()
+    qual1 = file1.readline()
+    qual2 = file2.readline()
+
+    fileout1.write(head1 + seq1 + line1 + qual1)
+    fileout2.write(head2 + seq2 + line2 + qual2)
+    count_read += 1
+
+    head1 = file1.readline()
+    head2 = file2.readline()
+
+    if count_read == nb_reads:
+        fileout1.close()
+        fileout2.close()
+        Popen(f'gzip {fileout_stem}_split_{count_file}_R1.fq', shell=True).wait()
+        Popen(f'gzip {fileout_stem}_split_{count_file}_R2.fq', shell=True).wait()
+
+        count_file += 1
+        fileout1 = open(f'{fileout_stem}_split_{count_file}_R1.fq', 'w')
+        fileout2 = open(f'{fileout_stem}_split_{count_file}_R2.fq', 'w')
+        count_read = 0
+
+fileout1.close()
+fileout2.close()
+Popen(f'gzip {fileout_stem}_split_{count_file}_R1.fq', shell=True).wait()
+Popen(f'gzip {fileout_stem}_split_{count_file}_R2.fq', shell=True).wait()
+file1.close()
+file2.close()
+```
+
+## 2. Adapter removal and mapping
+
+`submit_map.sh`
+
+```{bash, eval=FALSE}
+#!/bin/bash
+BASE_DIR="/path/to/puma_wgs"
+PIPELINE_SCRIPT="merge_map_clean_allsets.py"
+BWA_INDEX="/path/to/GCA_022316685.1_UM_PSub_1_genomic"
+LOG_DIR="$BASE_DIR/slurm_logs"
+mkdir -p "$LOG_DIR"
+NBTHREADS=40
+
+export PATH=/path/to/adapterremoval-2.3.4/build:$PATH
+
+SAMPLES=()
+for SAMPLE in "$BASE_DIR"/*; do
+    SAMPLE_NAME=$(basename "$SAMPLE")
+    if [ -d "$SAMPLE/$SAMPLE_NAME" ]; then
+        SAMPLES+=("$SAMPLE")
+    fi
+done
+
+NUM_SAMPLES=${#SAMPLES[@]}
+SAMPLES_FILE="$LOG_DIR/samples.txt"
+printf "%s\n" "${SAMPLES[@]}" > "$SAMPLES_FILE"
+
+sbatch --array=1-${NUM_SAMPLES}%4 <<EOT
+#!/bin/bash
+#SBATCH --job-name=puma_map
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=$NBTHREADS
+#SBATCH --mem=120G
+#SBATCH --time=48:00:00
+
+module load bwa
+module load python/3.13
+module load samtools/1.7
+
+SAMPLE_DIR=\$(sed -n "\${SLURM_ARRAY_TASK_ID}p" "$SAMPLES_FILE")
+SAMPLE_NAME=\$(basename "\$SAMPLE_DIR")
+
+python3 $PIPELINE_SCRIPT \$SAMPLE_NAME \$SAMPLE_DIR/\$SAMPLE_NAME $NBTHREADS $BWA_INDEX
+EOT
+```
+
+`merge_map_clean_allsets.py`
+
+```{python, eval=FALSE, python.reticulate=FALSE}
+#!/usr/bin/env python3
+import os
+import sys
+from subprocess import Popen
+import multiprocessing as mp
+import re
+
+def find_sample_sets(sample_name, sample_dir):
+    files = os.listdir(sample_dir)
+    pattern = re.compile(rf"^{sample_name}_(\d+)_split_\d+_R1\.fq\.gz$")
+    sets = set()
+    for f in files:
+        match = pattern.match(f)
+        if match:
+            sets.add(match.group(1))
+    return sorted(list(sets), key=int)
+
+def find_split_files(sample_name, read_set, sample_dir):
+    files = os.listdir(sample_dir)
+    split_files = []
+    for f in files:
+        if f.startswith(f"{sample_name}_{read_set}_split") and f.endswith('R1.fq.gz'):
+            parts = f.split('_')
+            try:
+                split_files.append((int(parts[3]), f))
+            except ValueError:
+                continue
+    split_files.sort()
+    return split_files
+
+def process_split(x, batch, sample_name, read_set, sample_dir, bwa_index_prefix, nbthreads, bams_dir, output_queue):
+    split_nb, _ = batch[x]
+    targ_stem = f"{sample_name}_{read_set}_split_{split_nb}"
+
+    adaptrem_dir = os.path.join(sample_dir, 'adaptrem')
+    os.makedirs(adaptrem_dir, exist_ok=True)
+    os.makedirs(bams_dir, exist_ok=True)
+
+    r1 = os.path.join(sample_dir, f"{targ_stem}_R1.fq.gz")
+    r2 = os.path.join(sample_dir, f"{targ_stem}_R2.fq.gz")
+    basename = os.path.join(adaptrem_dir, targ_stem)
+
+    cmd_adapter = (
+        f"AdapterRemoval --file1 {r1} --file2 {r2} "
+        f"--basename {basename} --trimns --trimqualities --collapse --gzip"
+    )
+    Popen(cmd_adapter, shell=True).wait()
+
+    cmds_bwa = [
+        f"bwa mem -M -t {nbthreads} {bwa_index_prefix} {basename}.pair1.truncated.gz {basename}.pair2.truncated.gz | samtools view -Sb - > {bams_dir}/{targ_stem}_PE.bam",
+        f"bwa mem -M -t {nbthreads} {bwa_index_prefix} {basename}.collapsed.gz | samtools view -Sb - > {bams_dir}/{targ_stem}_ME.bam",
+        f"bwa mem -M -t {nbthreads} {bwa_index_prefix} {basename}.collapsed.truncated.gz | samtools view -Sb - > {bams_dir}/{targ_stem}_MEt.bam"
+    ]
+    for cmd in cmds_bwa:
+        Popen(cmd, shell=True).wait()
+
+    output_queue.put(f"Finished {targ_stem}")
+
+def main():
+    sample_name = sys.argv[1]
+    sample_dir = sys.argv[2]
+    nbthreads = max(1, int(sys.argv[3]) // 2)
+    bwa_index_prefix = sys.argv[4]
+
+    bams_dir = os.path.join(sample_dir, "adaptrem", "bams")
+
+    for read_set in find_sample_sets(sample_name, sample_dir):
+        split_files = find_split_files(sample_name, read_set, sample_dir)
+        batches = [split_files[i:i + nbthreads] for i in range(0, len(split_files), nbthreads)]
+        for batch in batches:
+            output_queue = mp.Queue()
+            processes = [
+                mp.Process(
+                    target=process_split,
+                    args=(i, batch, sample_name, read_set, sample_dir, bwa_index_prefix, nbthreads, bams_dir, output_queue)
+                )
+                for i in range(len(batch))
+            ]
+            for p in processes: p.start()
+            for p in processes: p.join()
+            [output_queue.get() for _ in processes]
+
+if __name__ == "__main__":
+    main()
+```
+
+## 3. Merge BAMs, add read groups, mark duplicates
+
+`submit_merge_bams.sh`
+
+```{bash, eval=FALSE}
+#!/bin/bash
+# Usage: ./submit_merge_bams.sh samples.txt
+
+SAMPLE_LIST=$1
+
+while read -r SAMPLE; do
+    [[ -z "$SAMPLE" ]] && continue
+
+    sbatch <<EOT
+#!/bin/bash
+#SBATCH --job-name=merge_${SAMPLE}
+#SBATCH --nodes=1
+#SBATCH --exclusive
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=160
+#SBATCH --mem=512G
+#SBATCH --time=48:00:00
+
+module load samtools
+
+export JAVA_HOME=/path/to/openjdk17
+export PATH=\$JAVA_HOME/bin:\$PATH
+
+./merge_bams_script.sh $SAMPLE
+EOT
+
+done < "$SAMPLE_LIST"
+```
+
+`merge_bams_script.sh`
+
+```{bash, eval=FALSE}
+#!/bin/bash
+# Usage: ./merge_bams_script.sh SAMPLE_NAME
+
+SAMPLE=$1
+
+BAMS_DIR="/path/to/puma_wgs/${SAMPLE}/${SAMPLE}/adaptrem/bams"
+JAVA="/path/to/openjdk17/bin/java"
+PICARD="/path/to/picard.jar"
+
+cd "$BAMS_DIR" || exit 1
+
+process_bam_type() {
+    local TYPE=$1
+
+    SPLIT_BAMS=( $(ls ${SAMPLE}_*_split_*_${TYPE}.bam 2>/dev/null) )
+    if [ ${#SPLIT_BAMS[@]} -eq 0 ]; then
+        return
+    fi
+
+    MERGED_BAM="${SAMPLE}_${TYPE}_merged.bam"
+    samtools merge "$MERGED_BAM" "${SPLIT_BAMS[@]}"
+
+    SORTED_BAM="${SAMPLE}_${TYPE}_merged.sort.bam"
+    samtools sort -o "$SORTED_BAM" "$MERGED_BAM"
+    samtools index "$SORTED_BAM"
+
+    RG_BAM="${SAMPLE}_${TYPE}_merged.sort.RG.bam"
+    $JAVA -jar $PICARD AddOrReplaceReadGroups \
+        I="$SORTED_BAM" \
+        O="$RG_BAM" \
+        LB=Veeramah PL=COMPLETE PU=BGI SM="$SAMPLE" CN=BGI RGID="${SAMPLE}_${TYPE}" \
+        VALIDATION_STRINGENCY=SILENT
+
+    FINAL_SORT_BAM="${SAMPLE}_${TYPE}_merged.sort.RG.final.bam"
+    samtools sort -o "$FINAL_SORT_BAM" "$RG_BAM"
+    samtools index "$FINAL_SORT_BAM"
+
+    MKDUP_BAM="${SAMPLE}_${TYPE}_merged.sort.RG.final.Mkdup.bam"
+    $JAVA -jar $PICARD MarkDuplicates \
+        I="$FINAL_SORT_BAM" \
+        O="$MKDUP_BAM" \
+        M="${SAMPLE}_${TYPE}_merged.metrics" \
+        AS=TRUE REMOVE_DUPLICATES=FALSE VALIDATION_STRINGENCY=LENIENT
+    samtools index "$MKDUP_BAM"
+
+    samtools flagstat "$MKDUP_BAM" > "${MKDUP_BAM}.flagstat"
+
+    rm -f "$MERGED_BAM" "$SORTED_BAM" "$RG_BAM" "$FINAL_SORT_BAM"
+}
+
+process_bam_type "PE"
+process_bam_type "ME"
+
+PE_FINAL="${SAMPLE}_PE_merged.sort.RG.final.Mkdup.bam"
+ME_FINAL="${SAMPLE}_ME_merged.sort.RG.final.Mkdup.bam"
+
+if [ -f "$PE_FINAL" ] && [ -f "$ME_FINAL" ]; then
+    FINAL_BAM="${SAMPLE}_PE_ME_merged.sort.Mkdup.bam"
+    samtools merge "$FINAL_BAM" "$PE_FINAL" "$ME_FINAL"
+
+    SORTED_FINAL="${FINAL_BAM%.bam}.sort.bam"
+    samtools sort -o "$SORTED_FINAL" "$FINAL_BAM"
+    samtools index "$SORTED_FINAL"
+
+    $JAVA -jar $PICARD MarkDuplicates \
+        I="$SORTED_FINAL" \
+        O="$FINAL_BAM" \
+        M="${SAMPLE}_PE_ME_merged.metrics" \
+        AS=TRUE REMOVE_DUPLICATES=FALSE VALIDATION_STRINGENCY=LENIENT
+    samtools index "$FINAL_BAM"
+
+    samtools flagstat "$FINAL_BAM" > "${FINAL_BAM}.flagstat"
+fi
+```
+
+## 4. Initial variant calling (HaplotypeCaller)
+
+Run once per BAM, with the BAM path supplied at submission.
+
+`hapcaller_batch.sb`
+
+```{bash, eval=FALSE}
+#!/bin/sh
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=160
+#SBATCH --time=12:00:00
+
+module load python/3.13
+module load samtools/1.7
+
+if [ -z "$BAM" ]; then
+    echo "Error: BAM environment variable not set!"
+    exit 1
+fi
+
+REF="/path/to/GCA_022316685.1_UM_PSub_1_genomic.fna"
+OUTDIR="/path/to/init_var_call"
+
+GATK="/path/to/gatk-package-4.6.2.0-local.jar"
+JAVA="/path/to/openjdk17/bin/java"
+
+mkdir -p "$OUTDIR"
+
+source ~/venvs/bio/bin/activate
+python3 parallel_hapcaller.py \
+    --bam "$BAM" \
+    --reference "$REF" \
+    --outdir "$OUTDIR" \
+    --threads 160 \
+    --batch_size 3 \
+    --threads_per_batch 40 \
+    --gatk "$GATK" \
+    --java "$JAVA"
+```
+
+`parallel_hapcaller.py`
+
+```{python, eval=FALSE, python.reticulate=FALSE}
+#!/usr/bin/env python3
+import os
+import subprocess
+from Bio import SeqIO
+from multiprocessing import Pool
+import argparse
+import tempfile
+
+parser = argparse.ArgumentParser(description="Parallelized GATK HaplotypeCaller on a single BAM")
+parser.add_argument("--bam", required=True)
+parser.add_argument("--reference", required=True)
+parser.add_argument("--outdir", required=True)
+parser.add_argument("--threads", type=int, default=160)
+parser.add_argument("--batch_size", type=int, default=20)
+parser.add_argument("--threads_per_batch", type=int, default=4)
+parser.add_argument("--gatk", required=True)
+parser.add_argument("--java", required=True)
+args = parser.parse_args()
+
+os.makedirs(args.outdir, exist_ok=True)
+sample = os.path.basename(args.bam).split('.')[0]
+
+contigs = [r.id for r in SeqIO.parse(args.reference, "fasta")]
+batches = [contigs[i:i+args.batch_size] for i in range(0, len(contigs), args.batch_size)]
+
+def run_batch(batch):
+    with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".list", dir=args.outdir) as f:
+        for contig in batch:
+            f.write(contig + "\n")
+        interval_file = f.name
+
+    out_vcf = os.path.join(args.outdir, f"{sample}_{batch[0]}_{batch[-1]}.g.vcf.gz")
+    cmd = [
+        args.java, "-Xmx60G", "-jar", args.gatk,
+        "HaplotypeCaller",
+        "-R", args.reference,
+        "-I", args.bam,
+        "--emit-ref-confidence", "GVCF",
+        "-L", interval_file,
+        "-O", out_vcf,
+        "--native-pair-hmm-threads", str(args.threads_per_batch)
+    ]
+    subprocess.run(cmd, check=True)
+    os.remove(interval_file)
+    return out_vcf
+
+max_parallel_batches = args.threads // args.threads_per_batch
+with Pool(processes=max_parallel_batches) as pool:
+    vcf_files = pool.map(run_batch, batches)
+
+merged_vcf = os.path.join(args.outdir, f"{sample}.g.vcf.gz")
+merge_cmd = [
+    args.java, "-Xmx60G", "-jar", args.gatk,
+    "GatherVcfs"
+] + [f"-I {vcf}" for vcf in vcf_files] + ["-O", merged_vcf]
+subprocess.run(" ".join(merge_cmd), shell=True, check=True)
+
+for vcf in vcf_files:
+    os.remove(vcf)
+    if os.path.exists(vcf + ".tbi"):
+        os.remove(vcf + ".tbi")
+```
+
+## 5. Initial GenomicsDBImport
+
+```{bash, eval=FALSE}
+for f in *.g.vcf.gz; do
+    s=$(basename "$f" .g.vcf.gz)
+    echo -e "${s}\t$(realpath "$f")"
+done > cohort.sample_map
+
+bcftools view -h <ONE_SAMPLE>.g.vcf.gz | grep '^##contig' | sed -E 's/.*ID=([^,>]+).*/\1/' > contigs.txt
+
+mkdir -p contig_chunks
+split -l 100 contigs.txt contig_chunks/chunk_ --additional-suffix=.list
+
+cd contig_chunks
+i=1
+for f in chunk_*.list; do
+  mv "$f" chunk_${i}.list
+  i=$((i+1))
+done
+```
+
+`genomicsDBImport_init.sb`
+
+```{bash, eval=FALSE}
+#!/bin/bash
+#SBATCH --job-name=GenomicsDBImport
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=120G
+#SBATCH --time=48:00:00
+#SBATCH --array=1-30%4
+
+REF=/path/to/GCA_022316685.1_UM_PSub_1_genomic.fna
+SAMPLE_MAP=/path/to/init_var_call/cohort.sample_map
+CHUNK_DIR=/path/to/init_var_call/contig_chunks
+WORKSPACE_BASE=/path/to/init_var_call/genomicsdb_workspaces
+mkdir -p "$WORKSPACE_BASE"
+
+export TMPDIR=/tmp/$USER/genomicsdb_tmp_${SLURM_ARRAY_TASK_ID}
+mkdir -p "$TMPDIR"
+
+CHUNK_FILE=${CHUNK_DIR}/chunk_${SLURM_ARRAY_TASK_ID}.list
+WORKSPACE=${WORKSPACE_BASE}/chunk_${SLURM_ARRAY_TASK_ID}
+
+gatk --java-options "-Xmx110G" GenomicsDBImport \
+  --genomicsdb-workspace-path "${WORKSPACE}" \
+  --sample-name-map "${SAMPLE_MAP}" \
+  --tmp-dir "${TMPDIR}" \
+  --batch-size 20 \
+  --reader-threads 16 \
+  -L "${CHUNK_FILE}" \
+  --reference "${REF}"
+
+rm -rf "$TMPDIR"
+```
+
+## 6. Initial GenotypeGVCFs
+
+`genotype_chunks_init.sb`
+
+```{bash, eval=FALSE}
+#!/bin/bash
+#SBATCH --job-name=GenotypeGVCFs
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=40
+#SBATCH --time=24:00:00
+#SBATCH --array=1-30%4
+
+export PATH=/path/to/openjdk17/bin:$PATH
+
+REF=/path/to/GCA_022316685.1_UM_PSub_1_genomic.fna
+WORKSPACE_BASE=/path/to/init_var_call/genomicsdb_workspaces
+OUTPUT_DIR=/path/to/init_var_call/genotyped_chunks
+mkdir -p "$OUTPUT_DIR"
+
+export TMPDIR=/tmp/$USER/genotype_tmp_${SLURM_ARRAY_TASK_ID}
+mkdir -p "$TMPDIR"
+
+gatk --java-options "-Xmx250G -XX:ActiveProcessorCount=40 -Djava.io.tmpdir=$TMPDIR" GenotypeGVCFs \
+  -R "${REF}" \
+  -V "gendb://${WORKSPACE_BASE}/chunk_${SLURM_ARRAY_TASK_ID}" \
+  -O "${OUTPUT_DIR}/chunk_${SLURM_ARRAY_TASK_ID}.vcf.gz"
+
+rm -rf "$TMPDIR"
+```
+
+## 7. Hard filtering (known sites for BQSR)
+
+```{bash, eval=FALSE}
+ls genotyped_chunks/chunk_*.vcf.gz | sort -V > chunks.list
+
+gatk GatherVcfs -I chunks.list -O merged_genotyped_chunks.vcf.gz
+gatk IndexFeatureFile -I merged_genotyped_chunks.vcf.gz
+
+bcftools view -v snps merged_genotyped_chunks.vcf.gz -Oz -o all_snps.vcf.gz
+bcftools index -f all_snps.vcf.gz
+
+bcftools view -e 'QUAL<50 || INFO/QD<2 || INFO/FS>60 || INFO/SOR>3 || INFO/MQ<40' \
+  all_snps.vcf.gz -Oz -o known_sites.snps.vcf.gz
+bcftools index -f known_sites.snps.vcf.gz
+
+bcftools view -v indels merged_genotyped_chunks.vcf.gz -Oz -o all_indels.vcf.gz
+bcftools index -f all_indels.vcf.gz
+
+bcftools view -e 'INFO/QD<2 || QUAL<50 || INFO/FS>60' \
+  all_indels.vcf.gz -Oz -o known_sites.indels.vcf.gz
+bcftools index -f known_sites.indels.vcf.gz
+
+bcftools concat known_sites.snps.vcf.gz known_sites.indels.vcf.gz \
+  -a -O z -o known_sites.snp_indel.vcf.gz
+```
+
+## 8. Base quality score recalibration
+
+`bqsr.sb`
+
+```{bash, eval=FALSE}
+#!/bin/bash
+#SBATCH --job-name=BQSR
+#SBATCH --nodes=1
+#SBATCH --mem=200G
+#SBATCH --time=8:00:00
+
+export PATH=/path/to/openjdk17/bin:$PATH
+
+REF=/path/to/GCA_022316685.1_UM_PSub_1_genomic.fna
+KNOWN_SITES=/path/to/known_sites.snp_indel.vcf.gz
+BAM_DIR=/path/to/prelim_bams
+OUTPUT_DIR=/path/to/BQSR/recal2
+mkdir -p "$OUTPUT_DIR"
+
+TMPDIR=/tmp/$USER/bqsr_tmp
+mkdir -p "$TMPDIR"
+
+BAMS=(
+  AZH055 AZH091 FE13K09 FE13K10 FE13K36 FE14K44 FE14K57 FE14K78 FE14K96 FE15K28
+  FE15K33 FE15K50 FG05K08 FG05K10 FG07K03 FG07K23 FG08K10 MB424 MBA267 ONB072
+  PM141 PM150 PM223
+)
+
+for S in "${BAMS[@]}"; do
+    INPUT_BAM="${BAM_DIR}/${S}_PE_ME_merged.sort.Mkdup.bam"
+    RECAL_TABLE="${OUTPUT_DIR}/${S}_PE_ME_merged.sort.Mkdup.recal2.table"
+    OUTPUT_BAM="${OUTPUT_DIR}/${S}_PE_ME_merged.sort.Mkdup.recal2.bam"
+
+    gatk --java-options "-Xmx180G -XX:ActiveProcessorCount=16 -Djava.io.tmpdir=$TMPDIR" BaseRecalibrator \
+        -R "$REF" \
+        -I "$INPUT_BAM" \
+        --known-sites "$KNOWN_SITES" \
+        -O "$RECAL_TABLE"
+
+    gatk --java-options "-Xmx180G -XX:ActiveProcessorCount=16 -Djava.io.tmpdir=$TMPDIR" ApplyBQSR \
+        -R "$REF" \
+        -I "$INPUT_BAM" \
+        --bqsr-recal-file "$RECAL_TABLE" \
+        -O "$OUTPUT_BAM"
+done
+
+rm -rf "$TMPDIR"
+```
+
+## 9. Final variant calling (HaplotypeCaller)
+
+Same as Step 4, run on the recalibrated BAMs with output to `final_var_call/`.
+
+## 10. Final GenomicsDBImport
+
+PM141, PM150 and PM223 (*P. subis*, different subspecies) were included in joint genotyping for a separate PCA and removed before variant filtering.
+
+`cohort.sample_map`
+
+```{bash, eval=FALSE}
+AZH055_PE_ME_merged_recal2	AZH055_PE_ME_merged_recal2.g.vcf.gz
+AZH091_PE_ME_merged_recal2	AZH091_PE_ME_merged_recal2.g.vcf.gz
+FE13K09_PE_ME_merged_recal2	FE13K09_PE_ME_merged_recal2.g.vcf.gz
+FE13K10_PE_ME_merged_recal2	FE13K10_PE_ME_merged_recal2.g.vcf.gz
+FE13K36_PE_ME_merged_recal2	FE13K36_PE_ME_merged_recal2.g.vcf.gz
+FE14K44_PE_ME_merged_recal2	FE14K44_PE_ME_merged_recal2.g.vcf.gz
+FE14K57_PE_ME_merged_recal2	FE14K57_PE_ME_merged_recal2.g.vcf.gz
+FE14K78_PE_ME_merged_recal2	FE14K78_PE_ME_merged_recal2.g.vcf.gz
+FE14K96_PE_ME_merged_recal2	FE14K96_PE_ME_merged_recal2.g.vcf.gz
+FE15K28_PE_ME_merged_recal2	FE15K28_PE_ME_merged_recal2.g.vcf.gz
+FE15K33_PE_ME_merged_recal2	FE15K33_PE_ME_merged_recal2.g.vcf.gz
+FE15K50_PE_ME_merged_recal2	FE15K50_PE_ME_merged_recal2.g.vcf.gz
+FG05K08_PE_ME_merged_recal2	FG05K08_PE_ME_merged_recal2.g.vcf.gz
+FG05K10_PE_ME_merged_recal2	FG05K10_PE_ME_merged_recal2.g.vcf.gz
+FG07K03_PE_ME_merged_recal2	FG07K03_PE_ME_merged_recal2.g.vcf.gz
+FG07K23_PE_ME_merged_recal2	FG07K23_PE_ME_merged_recal2.g.vcf.gz
+FG08K10_PE_ME_merged_recal2	FG08K10_PE_ME_merged_recal2.g.vcf.gz
+MB424_PE_ME_merged_recal2	MB424_PE_ME_merged_recal2.g.vcf.gz
+MBA267_PE_ME_merged_recal2	MBA267_PE_ME_merged_recal2.g.vcf.gz
+ONB072_PE_ME_merged_recal2	ONB072_PE_ME_merged_recal2.g.vcf.gz
+PM141_PE_ME_merged_recal2	PM141_PE_ME_merged_recal2.g.vcf.gz
+PM150_PE_ME_merged_recal2	PM150_PE_ME_merged_recal2.g.vcf.gz
+PM223_PE_ME_merged_recal2	PM223_PE_ME_merged_recal2.g.vcf.gz
+```
+
+`genomicDBImport.sb`
+
+```{bash, eval=FALSE}
+#!/bin/bash
+#SBATCH --job-name=GenomicsDBImport
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=40
+#SBATCH --mem=250G
+#SBATCH --time=24:00:00
+#SBATCH --array=1-30%4
+
+export PATH=/path/to/openjdk17/bin:$PATH
+
+REF=/path/to/GCA_022316685.1_UM_PSub_1_genomic.fna
+SAMPLE_MAP=/path/to/final_var_call/cohort.sample_map
+CHUNK_DIR=/path/to/init_var_call/contig_chunks
+WORKSPACE_BASE=/path/to/final_var_call/genomicsdb_final
+mkdir -p "$WORKSPACE_BASE"
+
+export TMPDIR=/tmp/$USER/genomicsdb_tmp_${SLURM_ARRAY_TASK_ID}
+mkdir -p "$TMPDIR"
+
+CHUNK_FILE=${CHUNK_DIR}/chunk_${SLURM_ARRAY_TASK_ID}.list
+WORKSPACE=${WORKSPACE_BASE}/chunk_${SLURM_ARRAY_TASK_ID}
+
+gatk --java-options "-Xmx250G -XX:+UseG1GC -XX:+UseStringDeduplication" GenomicsDBImport \
+  --genomicsdb-workspace-path "${WORKSPACE}" \
+  --sample-name-map "${SAMPLE_MAP}" \
+  --tmp-dir "${TMPDIR}" \
+  --batch-size 20 \
+  --reader-threads 16 \
+  -L "${CHUNK_FILE}" \
+  --reference "${REF}"
+
+rm -rf "$TMPDIR"
+```
+
+## 11. Final GenotypeGVCFs
+
+`genotype_chunks.sb`
+
+```{bash, eval=FALSE}
+#!/bin/bash
+#SBATCH --job-name=GenotypeGVCFs
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=40
+#SBATCH --mem=250G
+#SBATCH --time=12:00:00
+#SBATCH --array=1-30%10
+
+export PATH=/path/to/openjdk17/bin:$PATH
+
+REF=/path/to/GCA_022316685.1_UM_PSub_1_genomic.fna
+WORKSPACE_BASE=/path/to/final_var_call/genomicsdb_final
+OUTPUT_DIR=/path/to/final_var_call/genotyped_chunks_final
+mkdir -p "$OUTPUT_DIR"
+
+export TMPDIR=/tmp/$USER/genotype_tmp_${SLURM_ARRAY_TASK_ID}
+mkdir -p "$TMPDIR"
+
+gatk --java-options "-Xmx250G -XX:ActiveProcessorCount=40 -Djava.io.tmpdir=$TMPDIR" GenotypeGVCFs \
+  -R "${REF}" \
+  -V "gendb://${WORKSPACE_BASE}/chunk_${SLURM_ARRAY_TASK_ID}" \
+  -O "${OUTPUT_DIR}/chunk_${SLURM_ARRAY_TASK_ID}.vcf.gz"
+
+rm -rf "$TMPDIR"
+```
+
+## 12. Merge final genotyped chunks
+
+```{bash, eval=FALSE}
+ls genotyped_chunks_final/chunk_*.vcf.gz | sort -V > final_chunks.list
+
+gatk GatherVcfs -I final_chunks.list -O final_genotyped.vcf.gz
+gatk IndexFeatureFile -I final_genotyped.vcf.gz
+```
+
+## 13. All-sites GenotypeGVCFs
+
+`genotype_chunks_allsites.sb`
+
+```{bash, eval=FALSE}
+#!/bin/bash
+#SBATCH --job-name=GenotypeGVCFs_allsites
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=40
+#SBATCH --mem=250G
+#SBATCH --time=24:00:00
+#SBATCH --array=1-30%4
+set -euo pipefail
+
+export PATH=/path/to/openjdk17/bin:$PATH
+
+REF=/path/to/GCA_022316685.1_UM_PSub_1_genomic.fna
+WORKSPACE_BASE=/path/to/final_var_call/genomicsdb_final
+OUTPUT_DIR=/path/to/final_var_call/genotyped_chunks_allsites
+mkdir -p "$OUTPUT_DIR"
+
+TMPDIR=/path/to/tmp/gatk_tmp_${SLURM_ARRAY_TASK_ID}_${SLURM_JOB_ID}
+mkdir -p "$TMPDIR"
+
+gatk --java-options "-Xmx230G -XX:ActiveProcessorCount=${SLURM_CPUS_PER_TASK} -Djava.io.tmpdir=$TMPDIR" GenotypeGVCFs \
+    -R "$REF" \
+    -V "gendb://${WORKSPACE_BASE}/chunk_${SLURM_ARRAY_TASK_ID}" \
+    --include-non-variant-sites \
+    -O "${OUTPUT_DIR}/chunk_${SLURM_ARRAY_TASK_ID}.allsites.vcf.gz"
+
+rm -rf "$TMPDIR"
+```

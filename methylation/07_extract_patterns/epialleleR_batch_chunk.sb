@@ -1,0 +1,34 @@
+#!/bin/bash
+#SBATCH --job-name=epiallele_cpg_chunk_aa
+#SBATCH --partition=short
+#SBATCH --account=delmore_lab
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=128G
+#SBATCH --time=12:00:00
+#SBATCH --array=1-20
+#SBATCH --output=slurm_logs/%x_%A_%a.out
+#SBATCH --error=slurm_logs/%x_%A_%a.err
+
+set -euo pipefail
+module load apptainer
+
+BAM_LIST=your_bams_list.txt # text file with full file paths to CGI subsetted bams
+
+BAM=$(sed -n "${SLURM_ARRAY_TASK_ID}p" "$BAM_LIST")
+
+BED=$PWD/cpg_island_chunks/cpg_chunk_aa
+CHUNK_ID=cpg_chunk_aa
+
+OUTDIR=$PWD/results_cpg_chunk_aa
+mkdir -p "$OUTDIR"
+
+apptainer exec \
+    --bind /insomnia001:/insomnia001 \
+    epialleleR.sif \
+    Rscript extract_incremental_v2.R \
+        "$BAM" \
+        "$BED" \
+        "$CHUNK_ID" \
+        "$OUTDIR"

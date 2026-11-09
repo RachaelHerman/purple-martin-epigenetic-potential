@@ -1,0 +1,57 @@
+Bootstrap: docker
+From: rocker/r-ver:4.3.3
+
+%post
+    set -e
+
+    # ----------------------------
+    # System dependencies (CRITICAL)
+    # ----------------------------
+    apt-get update && apt-get install -y \
+        build-essential \
+        libcurl4-openssl-dev \
+        libssl-dev \
+        libxml2-dev \
+        zlib1g-dev \
+        libbz2-dev \
+        liblzma-dev \
+        libpng-dev \
+        libjpeg-dev \
+        libfreetype6-dev \
+        libfontconfig1-dev \
+        libgit2-dev \
+        && apt-get clean
+
+
+    R -e "install.packages('BiocManager', repos='https://cloud.r-project.org')"
+
+    R -e "BiocManager::install(version = '3.18', ask = FALSE, update = FALSE)"
+
+    R -e "BiocManager::install(c(
+        'BiocGenerics',
+        'S4Vectors',
+        'IRanges',
+        'GenomeInfoDb',
+        'GenomicRanges',
+        'Biostrings'
+    ), ask = FALSE, update = FALSE)"
+
+    R -e "BiocManager::install(c(
+        'Rsamtools',
+        'GenomicAlignments',
+        'rtracklayer'
+    ), ask = FALSE, update = FALSE)"
+
+    R -e "BiocManager::install(c(
+        'GenomicFeatures',
+        'AnnotationDbi'
+    ), ask = FALSE, update = FALSE)"
+
+    R -e "BiocManager::install('epialleleR', ask = FALSE, update = FALSE)"
+
+%environment
+    export R_LIBS_USER=/usr/local/lib/R/site-library
+    export LC_ALL=C
+
+%runscript
+    exec R "$@"

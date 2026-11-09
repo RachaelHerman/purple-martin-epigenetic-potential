@@ -1,0 +1,62 @@
+#!/bin/bash
+#SBATCH --job-name=EMseq_align
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=24
+#SBATCH --mem=256G
+#SBATCH --time=12:00:00
+#SBATCH --array=0-19
+#SBATCH --output=logs/%x_%A_%a.out
+#SBATCH --error=logs/%x_%A_%a.err
+set -euo pipefail
+
+
+TRIM_DIR="/path/to/EM_seq_raw/trimmed_reads"
+REF_DIR="/path/to/bismark_reference"
+OUT_DIR="/path/to/EM_seq_raw/bams"
+PICARD="java -jar /path/to/picard.jar"
+THREADS=12
+
+SAMPLES=(
+AZH055_E AZH091_E FE13K09_E FE13K10_E FE13K36_E
+FE14K44_E FE14K57_E FE14K78_E FE14K96_E FE15K28_E
+FE15K33_E FE15K50_E FG05K08_E FG05K10_E FG07K03_E
+FG07K23_E FG08K10_E MB424_E MBA267_E ONB072_E
+)
+sample=${SAMPLES[$SLURM_ARRAY_TASK_ID]}
+
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate bismark_env
+
+R1="${TRIM_DIR}/${sample}_R1_val_1.fq.gz"
+R2="${TRIM_DIR}/${sample}_R2_val_2.fq.gz"
+SAMPLE_DIR="${OUT_DIR}/${sample}"
+mkdir -p "${SAMPLE_DIR}"
+
+# 1. Align to the bisulfite-converted reference (directional library, default settings)
+bismark --bowtie2 --multicore ${THREADS} \
+    --genome "${REF_DIR}" -1 "$R1" -2 "$R2" -o "${SAMPLE_DIR}"
+BAM="${SAMPLE_DIR}/${sample}_R1_val_1_bismark_bt2_pe.bam"
+
+# 2. Coordinate-sort and index
+SORTED="${SAMPLE_DIR}/${sample}.sort.bam"
+samtools sort -@ ${THREADS} -o "$SORTED" "$BAM"
+samtools index "$SORTED"
+
+# 3. Add read groups
+#    Values as originally run; read-group fields are metadata only and do not
+#    affect alignment, duplicate removal or methylation calls.
+RG="${SAMPLE_DIR}/${sample}.sort.RG.bam"
+$PICARD AddOrReplaceReadGroups I="$SORTED" O="$RG" \
+    LB=Veeramah PL=COMPLETE PU=BGI SM="$sample" CN=BGI \
+    VALIDATION_STRINGENCY=SILENT
+
+# 4. Remove PCR/optical duplicates
+DEDUP="${SAMPLE_DIR}/${sample}.sort.RG.dedup.bam"
+$PICARD MarkDuplicates I="$RG" O="$DEDUP" \
+    M="${SAMPLE_DIR}/${sample}.dedup.metrics.txt" \
+    ASSUME_SORTED=TRUE REMOVE_DUPLICATES=TRUE \
+    VALIDATION_STRINGENCY=LENIENT CREATE_INDEX=TRUE
+
+# 5. Name-sort for read-level methylation analysis (CGI subsetting / epialleleR)
+samtools sort -n -@ ${THREADS} -o "${SAMPLE_DIR}/${sample}.namesort.RG.dedup.bam" "$DEDUP"

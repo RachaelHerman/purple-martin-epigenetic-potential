@@ -1,0 +1,24 @@
+#!/bin/bash
+#SBATCH --job-name=GenotypeGVCFs
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=40
+#SBATCH --time=24:00:00
+#SBATCH --array=1-30%4
+
+export PATH=/path/to/openjdk17/bin:$PATH
+
+REF=/path/to/GCA_022316685.1_UM_PSub_1_genomic.fna
+WORKSPACE_BASE=/path/to/init_var_call/genomicsdb_workspaces
+OUTPUT_DIR=/path/to/init_var_call/genotyped_chunks
+mkdir -p "$OUTPUT_DIR"
+
+export TMPDIR=/tmp/$USER/genotype_tmp_${SLURM_ARRAY_TASK_ID}
+mkdir -p "$TMPDIR"
+
+gatk --java-options "-Xmx250G -XX:ActiveProcessorCount=40 -Djava.io.tmpdir=$TMPDIR" GenotypeGVCFs \
+  -R "${REF}" \
+  -V "gendb://${WORKSPACE_BASE}/chunk_${SLURM_ARRAY_TASK_ID}" \
+  -O "${OUTPUT_DIR}/chunk_${SLURM_ARRAY_TASK_ID}.vcf.gz"
+
+rm -rf "$TMPDIR"
